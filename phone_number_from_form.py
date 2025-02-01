@@ -1,61 +1,92 @@
 import cv2
 import numpy as np
 import tensorflow as tf
+from tensorflow.keras.models import load_model
 
-# Load the pre-trained neural network
-model = tf.keras.models.load_model("number_predictions_convolutional_2.keras")
 
-# Function to preprocess the image
-def preprocess_image(image_path):
-    image = cv2.imread(image_path, cv2.IMREAD_GRAYSCALE)
-    blurred = cv2.GaussianBlur(image, (5, 5), 0)
-    _, thresholded = cv2.threshold(blurred, 128, 255, cv2.THRESH_BINARY_INV | cv2.THRESH_OTSU)
-    return thresholded
+def find_largest_rectangle(img):
+    contours, _ = cv2.findContours(img, cv2.RETR_TREE, cv2.CHAIN_APPROX_NONE)[-2:]
+    best_rectangle = None
+    max_area = 0
 
-# Function to extract the table from the image
-def extract_table(image):
-    contours, _ = cv2.findContours(image, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    table_contour = max(contours, key=cv2.contourArea)  # Assuming the table is the largest contour
-    x, y, w, h = cv2.boundingRect(table_contour)
-    table = image[y:y + h, x:x + w]
-    return table
+    for cnt in contours:
+        area = cv2.contourArea(cnt)
+        if area > 1000:
+            rect = cv2.minAreaRect(cnt)
+            box = cv2.boxPoints(rect)
+            box = np.int0(box)
 
-# Function to segment entries in the table
-def segment_cells(table_image):
-    cells = []
-    num_rows, num_cols = 3, 3  # Assuming a 3x3 grid
-    cell_h, cell_w = table_image.shape[0] // num_rows, table_image.shape[1] // num_cols
+            if area > max_area:
+                best_rectangle = box
+                max_area = area
 
-    for i in range(num_rows):
-        for j in range(num_cols):
-            cell = table_image[i * cell_h:(i + 1) * cell_h, j * cell_w:(j + 1) * cell_w]
-            cells.append(cell)
-    return cells
+    return best_rectangle
 
-# Function to predict digits from cells
-def predict_digits(cells):
-    phone_number = ""
 
-    for cell in cells:
-        resized = cv2.resize(cell, (28, 28))  # Resize to the input size expected by the model
-        normalized = resized / 255.0
-        input_data = normalized.reshape(1, 28, 28, 1)
-        prediction = model.predict(input_data)
-        digit = np.argmax(prediction)
-        phone_number += str(digit)
+def order_rectangle_points(pts):
+    rect_pts = sorted(pts, key=lambda p: (p[1], p[0]))
+    top_pts = sorted(rect_pts[:2], key=lambda p: p[0])
+    bottom_pts = sorted(rect_pts[2:], key=lambda p: p[0])
 
-    return phone_number
+    return np.array([top_pts[0], top_pts[1], bottom_pts[1], bottom_pts[0]], dtype="float32")
 
-# Main processing pipeline
-def process_document(image_path):
-    processed_image = preprocess_image(image_path)
-    table_image = extract_table(processed_image)
-    cells = segment_cells(table_image)
-    phone_number = predict_digits(cells)
-    return phone_number
 
-# Example usage
-if __name__ == "__main__":
-    image_path = "form_with_phone_number.png"
-    phone_number = process_document(image_path)
-    print(f"Extracted Phone Number: {phone_number}")
+def warp_perspective(image, src_pts):
+    w = int(np.linalg.norm(src_pts[1] - src_pts[0]))
+    h = int(np.linalg.norm(src_pts[2] - src_pts[1]))
+
+    dst_pts = np.array([[0, 0], [w, 0], [w, h], [0, h]], dtype="float32")
+    M = cv2.getPerspectiveTransform(src_pts, dst_pts)
+
+    return cv2.warpPerspective(image, M, (w, h)), w
+
+
+def extract_digits(warped_image, w):
+    digit_width = w // 9
+    digits = []
+
+    for i in range(9):
+        digit_x = i * digit_width
+
+        digit_crop = warped_image[:, digit_x:digit_x + digit_width]
+
+        digit = cv2.resize(digit_crop, (28, 28), interpolation=cv2.INTER_LINEAR)
+        digit = digit.astype("float32") / 255.0
+        input_arr = np.reshape(digit, (1, 28, 28))
+
+        digits.append(input_arr)
+
+    return digits
+
+
+def predict_digit(model, image):
+    prediction = model.predict(image)
+    predicted_digit = np.argmax(prediction)
+
+    return str(predicted_digit)
+
+
+if __name__ == '__main__':
+    image_path = "./form_with_phone_number_3.png"
+    image = cv2.imread(image_path)
+
+    model_filename = "number_predictions_convolutional_2.keras"
+    model = load_model(model_filename)
+
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    _, thresh = cv2.threshold(gray, 150, 255, cv2.THRESH_BINARY_INV)
+
+    number_input_box = find_largest_rectangle(thresh)
+
+    ordered_pts = order_rectangle_points(number_input_box)
+    aligned_image, w = warp_perspective(thresh, ordered_pts)
+
+    if aligned_image is not None:
+        digit_images = extract_digits(aligned_image, w)
+        predicted_digits = [predict_digit(model, digit) for digit in digit_images]
+        phone_number = "".join(predicted_digits)
+        print("Phone Number:", phone_number)
+
+    else:
+        print("Perspective warping failed.")
+
